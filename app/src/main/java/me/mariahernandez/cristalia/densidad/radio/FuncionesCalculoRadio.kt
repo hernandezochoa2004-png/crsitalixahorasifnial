@@ -1,0 +1,1348 @@
+package me.mariahernandez.cristalia.densidad.radio
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.BaselineShift
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.sp
+import com.cristalia.model.EstructuraCristalina
+import com.cristalia.model.RelacionRadioParametro
+import com.cristalia.model.SistemaCristalino
+import me.mariahernandez.cristalia.celdaunitaria.Paleta
+
+
+import androidx.annotation.DrawableRes
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import me.mariahernandez.cristalia.R
+
+import androidx.compose.foundation.layout.RowScope
+
+/** Una fila de la tabla de conteo de iones (Vértices, Caras, Aristas, Centro, Huecos...). */
+data class FilaConteo(
+    val posicion: String,   // "Vértices", "Caras", "Aristas", "Centro", "Huecos tetraédricos"
+    val cantidad: Int,      // cuántas posiciones hay en la celda: 8, 6, 12, 1...
+    val fraccion: String,   // fracción de ion que aporta cada una: "⅛", "½", "¼", "1"
+    val aporte: Int,        // iones que aporta en total (cantidad × fracción)
+    val esAnion: Boolean    // true = anión (cian), false = catión (rosa)
+)
+
+data class DatosCalculoRadio(
+    val estructura: EstructuraCristalina,
+    val masaMolar: Double,
+    val radioCatPm: Double,
+    val radioAnPm: Double,
+    val aPm: Double,
+    val radioCatCmStr: String,
+    val radioAnCmStr: String,
+    val volumenCm3: Double,
+    val volumenCm3Str: String,
+    val densidadGcm3: Double,
+    val densidadGcm3Str: String,
+    val formulaAnionCationStr: String,
+    val zStr: String,
+    // AQUI (2)
+    val conteoFilas: List<FilaConteo> = emptyList(),
+    val totalAniones: Int = 0,
+    val totalCationes: Int = 0,
+    // Solo modo "Parámetro a" (aPm ya existe arriba)
+    val aCmStr: String = "",
+    val cPm: Double = 0.0,
+    val cCmStr: String = ""
+)
+
+object FuncionesCalculoRadio {
+
+    const val NUMERO_AVOGADRO = 6.02214076e23
+
+    private const val SUPERINDICES = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+
+    private fun superindice(n: Int): String =
+        n.toString().map { if (it == '-') '⁻' else SUPERINDICES[it - '0'] }.joinToString("")
+
+    /** 5.83e-24 -> "5.83 × 10⁻²⁴" (con superíndices reales y punto decimal fijo). */
+    fun formatoCientifico(valor: Double, decimales: Int = 2): String {
+        if (valor == 0.0) return "0"
+        var exp = Math.floor(Math.log10(Math.abs(valor))).toInt()
+        var mant = valor / Math.pow(10.0, exp.toDouble())
+        var texto = "%.${decimales}f".format(java.util.Locale.US, mant)
+        if (texto.trimStart('-').startsWith("10")) {   // el redondeo dio 10.00
+            exp += 1
+            mant = valor / Math.pow(10.0, exp.toDouble())
+            texto = "%.${decimales}f".format(java.util.Locale.US, mant)
+        }
+        return "$texto × 10${superindice(exp)}"
+    }
+
+    /** Textos y conteo de iones del paso 1 y 2. Lo comparten el modo Radio y el modo Volumen. */
+    private data class InfoEstructura(
+        val formulaAnionCation: String,
+        val zText: String,
+        // AQUI 3
+        val conteoFilas: List<FilaConteo>,
+        val totalAniones: Int,
+        val totalCationes: Int
+    )
+
+    private fun infoEstructura(estructura: EstructuraCristalina): InfoEstructura {
+        val (formulaAnionCation, zText) = when (estructura.id) {
+            "nacl" -> Pair("A₄B₄  ➔  4 AB", "z = 4 UF")
+            "blenda" -> Pair("A₄B₄  ➔  4 AB", "z = 4 AB")
+            "wurtzita" -> Pair("A₆B₆  ➔  6 AB", "z = 6 UF")
+            "cscl" -> Pair("AB  ➔  AB", "z = 1 UF")
+            "fluorita" -> Pair("A₈B₄  ➔  4 A₂B", "z = 4 UF")
+            "antifluorita" -> Pair("A₈B₄  ➔  4 A₂B", "z = 4 UF")
+            "yodurocadmio" -> Pair("A₃B₆ ➔ 3 AB₂", "z = 3 UF")
+            "rutilo" -> Pair("A₂B₄ ➔ 2 AB₂", "z = 2 UF")
+            else -> Pair("${estructura.nombre}  ➔  ${estructura.z} UF", "z = ${estructura.z} UF")
+        }
+
+        // AQUI (4)
+
+        // Tabla de conteo para el paso 1 (esAnion = true -> cian, false -> rosa)
+        val conteoFilas = when (estructura.id) {
+            "nacl" -> listOf(
+                FilaConteo("Vértices", 8, "⅛", 1, true),
+                FilaConteo("Caras", 6, "½", 3, true),
+                FilaConteo("Aristas", 12, "¼", 3, false),
+                FilaConteo("Centro", 1, "1", 1, false)
+            )
+            "blenda" -> listOf(
+                FilaConteo("Vértices", 8, "⅛", 1, true),
+                FilaConteo("Caras", 6, "½", 3, true),
+                FilaConteo("Centro", 4, "1", 4, false)
+            )
+            "cscl" -> listOf(
+                FilaConteo("Vértices", 8, "⅛", 1, true),
+                FilaConteo("Centro", 1, "1", 1, false)
+            )
+            "wurtzita" -> listOf(
+                FilaConteo("Vértices", 12, "⅙", 2, true),
+                FilaConteo("Interior", 3, "1", 3, true),
+                FilaConteo(posicion = "Caras", cantidad = 2, fraccion = "½", aporte = 1, esAnion=true),
+                FilaConteo("Aristas", 6, "⅓", 2, false),
+                FilaConteo("Interior", 4, "1", 4, false)
+            )
+            "fluorita" -> listOf(
+                FilaConteo("Interior", 8, "1", 8, false),
+                FilaConteo("Vértices", 8, "⅛", 1, true),
+                FilaConteo("Caras", 6, "½", 3, true)
+            )
+            "antifluorita" -> listOf(
+                FilaConteo("Vértices (8 cubos)", 8, "⅛ * 8", 8, false),
+                FilaConteo("Interior (4 cubos)", 1, "1 * 4", 4, true)
+            )
+            "yodurocadmio" -> listOf(
+                FilaConteo("Vértices", 12, "⅙", 2, true),
+                FilaConteo("Caras", 2, "½", 1, true),
+                FilaConteo("Interior", 3, "1", 3, true),
+                FilaConteo("Interior", 3, "1", 3, false)
+
+            )
+            "rutilo" -> listOf(
+                FilaConteo("Vértices", 8, "⅛", 1, false),
+                FilaConteo("Interior", 1, "1", 1, false),
+                FilaConteo("Caras", 4, "½", 2, true),
+                FilaConteo("Interior", 2, "1", 2, true)
+
+            )
+            else -> emptyList()
+        }
+        val totalAniones = conteoFilas.filter { it.esAnion }.sumOf { it.aporte }
+        val totalCationes = conteoFilas.filter { !it.esAnion }.sumOf { it.aporte }
+
+        return InfoEstructura(formulaAnionCation, zText, conteoFilas, totalAniones, totalCationes)   // AQUI (5)
+    }
+
+    /**
+     * Modo VOLUMEN: el usuario ya da el volumen de la celda (en cm³), así que no hay radios
+     * ni parámetro "a". Reutiliza DatosCalculoRadio para poder usar las mismas UI de los pasos
+     * 1, 2 y de densidad; los campos de radio / aPm quedan en 0 y no se muestran.
+     */
+    fun calcularDesdeVolumen(
+        estructura: EstructuraCristalina,
+        masaMolar: Double,
+        volumenCm3: Double
+    ): DatosCalculoRadio {
+        val densidad = (estructura.z * masaMolar) / (NUMERO_AVOGADRO * volumenCm3)
+        val (formulaAnionCation, zText, conteoFilas, totalAniones, totalCationes) =
+            infoEstructura(estructura)   // AQUI (7)
+
+        return DatosCalculoRadio(
+            estructura = estructura,
+            masaMolar = masaMolar,
+            radioCatPm = 0.0,
+            radioAnPm = 0.0,
+            aPm = 0.0,
+            radioCatCmStr = "",
+            radioAnCmStr = "",
+            volumenCm3 = volumenCm3,
+            volumenCm3Str = formatoCientifico(volumenCm3),
+            densidadGcm3 = densidad,
+            densidadGcm3Str = "%.2f".format(java.util.Locale.US, densidad),
+            formulaAnionCationStr = formulaAnionCation,
+            zStr = zText,
+            // AQUI 8
+            conteoFilas = conteoFilas,
+            totalAniones = totalAniones,
+            totalCationes = totalCationes
+        )
+    }
+
+    /**
+     * Modo PARÁMETRO A: el usuario da a (y c si la celda no es cúbica), en pm.
+     * El volumen sale de estructura.calcularVolumenCelda y el resto se arma con
+     * calcularDesdeVolumen; luego solo se añaden los datos de a y c para mostrarlos.
+     *
+     * Ojo: si estructura.requiereParametroC es true, cPm no puede ser null.
+     */
+    fun calcularDesdeParametroA(
+        estructura: EstructuraCristalina,
+        masaMolar: Double,
+        aPm: Double,
+        cPm: Double? = null
+    ): DatosCalculoRadio {
+        val volumenCm3 = estructura.calcularVolumenCelda(aPm, cPm)
+        return calcularDesdeVolumen(estructura, masaMolar, volumenCm3).copy(
+            aPm = aPm,
+            aCmStr = formatoCientifico(aPm * 1e-10),
+            cPm = cPm ?: 0.0,
+            cCmStr = if (cPm != null) formatoCientifico(cPm * 1e-10) else ""
+        )
+    }
+
+    fun calcularTodo(
+        estructura: EstructuraCristalina,
+        masaMolar: Double,
+        radioCatPm: Double,
+        radioAnPm: Double
+    ): DatosCalculoRadio {
+        val aPm = estructura.calcularParametroA(radioCatPm, radioAnPm) ?: (2.0 * (radioCatPm + radioAnPm))
+        val volumenCm3 = estructura.calcularVolumenCelda(aPm)
+        val densidad = (estructura.z * masaMolar) / (NUMERO_AVOGADRO * volumenCm3)
+
+        val radioCatCm = radioCatPm * 1e-10
+        val radioAnCm = radioAnPm * 1e-10
+
+        val (formulaAnionCation, zText, conteoFilas, totalAniones, totalCationes) =
+            infoEstructura(estructura)  // AQUI (9)
+
+        val catFormat = formatoCientifico(radioCatCm)
+        val anFormat = formatoCientifico(radioAnCm)
+        val volFormat = formatoCientifico(volumenCm3)
+
+        return DatosCalculoRadio(
+            estructura = estructura,
+            masaMolar = masaMolar,
+            radioCatPm = radioCatPm,
+            radioAnPm = radioAnPm,
+            aPm = aPm,
+            radioCatCmStr = catFormat,
+            radioAnCmStr = anFormat,
+            volumenCm3 = volumenCm3,
+            volumenCm3Str = volFormat,
+            densidadGcm3 = densidad,
+            densidadGcm3Str = "%.2f".format(java.util.Locale.US, densidad),
+            formulaAnionCationStr = formulaAnionCation,
+            zStr = zText,
+            // AQUI 9
+            conteoFilas = conteoFilas,
+            totalAniones = totalAniones,
+            totalCationes = totalCationes
+        )
+    }
+}
+
+// =====================================================================================
+//  UI DEL PASO 3 (VOLUMEN DE LA CELDA) — SOLO PARA NaCl
+// =====================================================================================
+//  OJO: este composable está escrito a mano para NaCl (celda FCC, a = 2(r+ + r-), V = a³).
+//  Las fórmulas, el texto de "a" y el desarrollo "V = [ 2 (rA⁺ + rB⁻) ]³" NO sirven para
+//  las otras 8 estructuras (Blenda, Wurtzita, CsCl, Fluorita, Antifluorita, CdI₂, Rutilo...),
+//  porque cada una tiene su propia relación radio–parámetro de red y su propio volumen
+//  (cúbico, hexagonal o tetragonal).
+//
+//  TODO: crear una versión por estructura (ContenidoVolumenBlenda, ContenidoVolumenCsCl...)
+//  y elegir cuál mostrar según datos.estructura.id, por ejemplo:
+//
+//      when (datos.estructura.id) {
+//          "nacl" -> ContenidoVolumenCelda(datos)   // <- esta
+//          // "blenda" -> ContenidoVolumenBlenda(datos)
+//          // "cscl"   -> ContenidoVolumenCsCl(datos)
+//          else     -> { /* pendiente */ }
+//      }
+// =====================================================================================
+
+private val FondoSubTarjeta = Color(0xFF111827)
+private val BordeSubTarjeta = Color(0xFF1E2A3D)
+private val FondoCaja = Color.Black.copy(alpha = 0.35f)
+private val TextoApagado = Color(0xFF9AA4B8)
+private val ColorCation = Paleta.Cian
+private val ColorAnion = Color(0xFFFF8A8A)
+
+// ---------- Helpers de texto ----------
+
+/** Escribe "r" con el subíndice "A⁺" / "B⁻" (rA⁺, rB⁻). */
+private fun AnnotatedString.Builder.radio(letra: String, carga: String) {
+    append("r")
+    withStyle(SpanStyle(baselineShift = BaselineShift.Subscript, fontSize = 0.75.em)) {
+        append(letra + carga)
+    }
+}
+
+/** 102.0 -> "102", 30.5 -> "30.5" */
+private fun numeroLimpio(v: Double): String =
+    if (v == Math.floor(v)) "%.0f".format(java.util.Locale.US, v)
+    else "%.2f".format(java.util.Locale.US, v).trimEnd('0').trimEnd('.')
+
+// ---------- Contenedores ----------
+
+@Composable
+private fun SubTarjeta(
+    titulo: String? = null,
+    bordeColor: Color = BordeSubTarjeta,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(FondoSubTarjeta)
+            .border(1.dp, bordeColor, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        if (titulo != null) {
+            Text(
+                text = titulo,
+                color = Paleta.TextoSecundario,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+        content()
+    }
+}
+
+@Composable
+private fun Caja(
+    bordeColor: Color = BordeSubTarjeta,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(FondoCaja)
+            .border(1.dp, bordeColor, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) { content() }
+}
+
+/** Fracción de unidades:  1 cm / 10¹⁰ pm  con "pm" tachado. */
+@Composable
+private fun FraccionConversion() {
+    Column(
+        modifier = Modifier.width(IntrinsicSize.Max),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("1 cm", color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(TextoApagado)
+        )
+        Text(
+            text = buildAnnotatedString {
+                append("10¹⁰ ")
+                withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { append("pm") }
+            },
+            color = TextoApagado,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun FilaRadio(
+    letra: String,
+    carga: String,
+    valorPm: Double,
+    resultadoCm: String,
+    colorResultado: Color
+) {
+    FilaConversion(buildAnnotatedString { radio(letra, carga) }, valorPm, resultadoCm, colorResultado)
+}
+
+/** Fila "símbolo = valor pm × (1 cm / 10¹⁰ pm) = resultado cm". Sirve para radios, a y c. */
+@Composable
+private fun FilaConversion(
+    simbolo: AnnotatedString,
+    valorPm: Double,
+    resultadoCm: String,
+    colorResultado: Color
+) {
+    Caja(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                text = buildAnnotatedString {
+                    append(simbolo)
+                    append(" = ${numeroLimpio(valorPm)} ")
+                    withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough, color = TextoApagado)) {
+                        append("pm")
+                    }
+                    append(" ×")
+                },
+                color = Color(0xFFD5DAE5),
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace
+            )
+            FraccionConversion()
+            Text(
+                text = "= $resultadoCm cm",
+                color = colorResultado,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.End,
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+}
+
+// ---------- Contenido del paso 3 (SOLO NaCl) ----------
+
+/** Paso 3 para NaCl únicamente: V = [ 2 (rA⁺ + rB⁻) ]³. No usar con otras estructuras. */
+@Composable
+fun ContenidoVolumenCelda(datos: DatosCalculoRadio) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) FÓRMULAS BASE
+        SubTarjeta("FÓRMULAS BASE") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Caja(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "V = a³", color = Color.White, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+                Caja(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = buildAnnotatedString {
+                            append("a = 2 "); radio("A", "⁺")
+                            append(" + 2 "); radio("B", "⁻")
+                        },
+                        color = Paleta.Cian, fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Box(Modifier.fillMaxWidth().height(1.dp).background(BordeSubTarjeta))
+
+            Text(
+                text = buildAnnotatedString {
+                    append("V = (2 "); radio("A", "⁺")
+                    append(" + 2 "); radio("B", "⁻"); append(")³")
+                },
+                color = Color(0xFFD5DAE5),
+                fontSize = 13.sp,
+                fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Text(
+                "Fórmula del volumen factorizada:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+            )
+
+            Caja(
+                bordeColor = Paleta.Cian.copy(alpha = 0.3f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = buildAnnotatedString {
+                        append("V = [ 2 ("); radio("A", "⁺")
+                        append(" + "); radio("B", "⁻"); append(") ]³")
+                    },
+                    color = Paleta.Cian, fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        // 2) RADIOS IÓNICOS Y CONVERSIÓN
+        SubTarjeta("RADIOS IÓNICOS Y CONVERSIÓN") {
+            FilaRadio("A", "⁺", datos.radioCatPm, datos.radioCatCmStr, ColorCation)
+            FilaRadio("B", "⁻", datos.radioAnPm, datos.radioAnCmStr, ColorAnion)
+        }
+
+        // 3) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "V = [ 2 (${datos.radioCatCmStr} + ${datos.radioAnCmStr}) ]³",
+                    color = Color(0xFFD5DAE5),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    "Volumen total:", color = Color.White, fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+// ======= Contenido del paso 3 para BLENDA =================00
+
+/** Cuadro para tu imagen. Pasa R.drawable.xxx; con null muestra el hueco vacío. */
+@Composable
+private fun EspacioImagenVolumen(modifier: Modifier = Modifier, @DrawableRes imagen: Int? = null) {
+    Box(
+        modifier = modifier
+            .aspectRatio(1.2f)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.Black)
+            .border(1.dp, BordeSubTarjeta, RoundedCornerShape(10.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (imagen != null) {
+            Image(
+                painter = painterResource(imagen),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+/** Texto "(rA⁺ + rB⁻)" reutilizable. */
+private fun AnnotatedString.Builder.sumaRadios() {
+    append("("); radio("A", "⁺"); append(" + "); radio("B", "⁻"); append(")")
+}
+
+
+//**----------------BLENDA               */
+/** Paso 3 para BLENDA (FCC_DIAGONAL): x = 4/√3 · (rA⁺ + rB⁻),  V = x³. */
+@Composable
+fun ContenidoVolumenBlenda(datos: DatosCalculoRadio) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) FÓRMULA BASE + IMÁGENES
+        SubTarjeta("FÓRMULA BASE") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "V = x³", color = Color.White, fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                EspacioImagenVolumen(Modifier.weight(1f), imagen = R.drawable.imgblenda2) // R.drawable.tu_imagen_1
+                EspacioImagenVolumen(Modifier.weight(1f), imagen = R.drawable.imgblenda1) // R.drawable.tu_imagen_2
+            }
+        }
+
+        // 2) DESARROLLO
+        SubTarjeta("DESARROLLO") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "( ? )² = ( x/4 )² + ( x/4 )²",
+                    color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = buildAnnotatedString {
+                        sumaRadios(); append("² = ( x/4 )² + ( ? )²")
+                    },
+                    color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = buildAnnotatedString { sumaRadios(); append("² = 3x² / 16") },
+                    color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+
+            Text(
+                "Aplicando raíz cuadrada y despejando:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = buildAnnotatedString {
+                        radio("A", "⁺"); append(" + "); radio("B", "⁻"); append(" = (√3 / 4) · x")
+                    },
+                    color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("x = ", color = Color.White, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    Fraccion(AnnotatedString("4"), AnnotatedString("√3"), color = Color.White, fontSize = 12.sp)
+                    Text(
+                        text = buildAnnotatedString { append(" · "); sumaRadios() },
+                        color = Color.White, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
+        // 3) V_celda = x³  →  fórmula final
+        SubTarjeta(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Text(
+                "Y como Vcelda = x³, entonces:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            Caja(bordeColor = Paleta.Cian.copy(alpha = 0.3f), modifier = Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("V = [ ", color = Paleta.Cian, fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    Fraccion(AnnotatedString("4"), AnnotatedString("√3"), color = Paleta.Cian, fontSize = 13.sp)
+                    Text(
+                        text = buildAnnotatedString { append(" · "); sumaRadios(); append(" ]³") },
+                        color = Paleta.Cian, fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
+        // 4) RADIOS IÓNICOS Y CONVERSIÓN
+        SubTarjeta("RADIOS IÓNICOS Y CONVERSIÓN") {
+            FilaRadio("A", "⁺", datos.radioCatPm, datos.radioCatCmStr, ColorCation)
+            FilaRadio("B", "⁻", datos.radioAnPm, datos.radioAnCmStr, ColorAnion)
+        }
+
+        // 5) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("V = [ ", color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    Fraccion(AnnotatedString("4"), AnnotatedString("√3"), fontSize = 11.sp)
+                    Text(
+                        text = " (${datos.radioCatCmStr} + ${datos.radioAnCmStr}) ]³",
+                        color = TextoClaro, fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Volumen total:", color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+// ===================================================
+// ---------- Paso 3 para WURTZITA (prisma hexagonal): V = A_b · c ----------
+
+@Composable
+private fun TF(texto: String, color: Color = TextoClaro, size: TextUnit = 12.sp, negrita: Boolean = false) {
+    Text(
+        texto, color = color, fontSize = size,
+        fontWeight = if (negrita) FontWeight.Bold else FontWeight.Normal,
+        fontFamily = FontFamily.Monospace
+    )
+}
+
+private fun AnnotatedString.Builder.sub(t: String) =
+    withStyle(SpanStyle(baselineShift = BaselineShift.Subscript, fontSize = 0.75.em)) { append(t) }
+
+@Composable
+private fun TA(
+    color: Color = TextoClaro, size: TextUnit = 12.sp, negrita: Boolean = false,
+    build: AnnotatedString.Builder.() -> Unit
+) {
+    Text(
+        buildAnnotatedString(build), color = color, fontSize = size,
+        fontWeight = if (negrita) FontWeight.Bold else FontWeight.Normal,
+        fontFamily = FontFamily.Monospace
+    )
+}
+
+@Composable
+private fun FF(num: String, den: String, color: Color = TextoClaro, size: TextUnit = 11.sp) =
+    Fraccion(AnnotatedString(num), AnnotatedString(den), color, size)
+
+@Composable
+private fun LineaFormula(
+    bordeColor: Color = BordeSubTarjeta,
+    content: @Composable RowScope.() -> Unit
+) {
+    Caja(bordeColor = bordeColor, modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically, content = content)
+    }
+}
+
+@Composable
+private fun ImagenConLeyenda(leyenda: String, modifier: Modifier = Modifier, @DrawableRes imagen: Int? = null) {
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        EspacioImagenVolumen(Modifier.fillMaxWidth(), imagen)
+        Text(leyenda, color = TextoApagado, fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace, textAlign = TextAlign.Center)
+    }
+}
+
+/** Paso 3 de WURTZITA (modo Parámetro a): V = A_b · c = (3√3/2) · a² · c. Usa datos.aPm / cPm. */
+@Composable
+fun ContenidoVolumenWurtzita(datos: DatosCalculoRadio) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 0) ENCABEZADO + IMÁGENES
+        SubTarjeta {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Caja { TA(Color.White, 12.sp, true) { append("V = A"); sub("b"); append(" · c") } }
+                TF("Geometría Hexagonal", Paleta.Cian, 11.sp, true)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ImagenConLeyenda("Triángulo equilátero (base)", Modifier.weight(1f), imagen = R.drawable.triangulo)          // R.drawable.xxx
+                ImagenConLeyenda("Empaquetamiento hexagonal (2r = a)", Modifier.weight(1f), imagen = R.drawable.abajo)   // R.drawable.xxx
+            }
+        }
+
+        // 1) ALTURA
+        SubTarjeta("1. Altura (h) del triángulo equilátero:") {
+            LineaFormula { TF("sen(60°) = "); FF("h", "a") }
+            LineaFormula { TF("h = a · sen(60°) = "); FF("a · √3", "2") }
+        }
+
+        // 2) ÁREA DEL TRIÁNGULO
+        SubTarjeta("2. Área del triángulo (A_t) base = a:") {
+            LineaFormula {
+                TA { append("A"); sub("t"); append(" = ") }
+                FF("base · h", "2"); TF(" = "); FF("a", "2"); TF(" · [ "); FF("a · √3", "2"); TF(" ]")
+            }
+            LineaFormula { TA { append("A"); sub("t"); append(" = ") }; FF("a² · √3", "4") }
+        }
+
+        // 3) ÁREA DE LA BASE HEXAGONAL
+        SubTarjeta("3. Área total base hexagonal (6 triángulos):") {
+            LineaFormula {
+                TA { append("A"); sub("b"); append(" = 6 · A"); sub("t"); append(" = 6 · [ ") }
+                FF("a² · √3", "4"); TF(" ]")
+            }
+            LineaFormula { TA { append("A"); sub("b"); append(" = ") }; FF("3 · √3", "2"); TF(" · a²") }
+        }
+
+        // 4) EXPRESIÓN FINAL
+        SubTarjeta(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            TF("Expresión analítica del volumen de la celda:", TextoApagado, 11.sp)
+            LineaFormula(Paleta.Cian.copy(alpha = 0.3f)) {
+                TA(Paleta.Cian, 13.sp, true) {
+                    append("V"); sub("celda"); append(" = A"); sub("b"); append(" · c = ")
+                }
+                FF("3 · √3", "2", Paleta.Cian, 12.sp)
+                TF(" · a² · c", Paleta.Cian, 13.sp, true)
+            }
+        }
+
+        // 5) PARÁMETROS DE RED Y CONVERSIÓN
+        SubTarjeta("PARÁMETROS DE RED Y CONVERSIÓN") {
+            FilaConversion(AnnotatedString("a"), datos.aPm, datos.aCmStr, ColorCation)
+            FilaConversion(AnnotatedString("c"), datos.cPm, datos.cCmStr, ColorAnion)
+        }
+
+        // 6) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN", bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TF("V = ", Color.White, 13.sp, true)
+                        FF("3 · √3", "2", Color.White, 12.sp)
+                        TF(" ×", Color.White, 13.sp, true)
+                    }
+                    TF("( ${datos.aCmStr} )² × ( ${datos.cCmStr} )", TextoClaro, 12.sp)
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                TF("Volumen total:", Color.White, 12.sp)
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End, modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+// ---------- Paso 3 para CsCl (BCC_DIAGONAL): a = (1/√3)·(2rA⁺ + 2rB⁻),  V = a³ ----------
+
+/** Texto "(2 rA⁺ + 2 rB⁻)" reutilizable. */
+private fun AnnotatedString.Builder.dobleSumaRadios() {
+    append("(2 "); radio("A", "⁺"); append(" + 2 "); radio("B", "⁻"); append(")")
+}
+
+/** Paso 3 para CsCl: el catión toca al anión por la diagonal del cubo, 2rA⁺ + 2rB⁻ = a·√3. */
+@Composable
+fun ContenidoVolumenCsCl(datos: DatosCalculoRadio) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) FÓRMULAS BASE
+        SubTarjeta("FÓRMULAS BASE") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Caja(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "V = a³", color = Color.White, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+                Caja(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "ℓ² = a² + a²", color = Paleta.Cian, fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+            Text(
+                "ℓ = diagonal de una cara del cubo",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+        }
+
+        // 2) DESARROLLO
+        SubTarjeta("DESARROLLO") {
+            LineaFormula {
+                TA { dobleSumaRadios(); append("² = a² + ℓ²") }
+            }
+            LineaFormula {
+                TA { dobleSumaRadios(); append("² = a² + a² + a²") }
+            }
+            LineaFormula {
+                TA { dobleSumaRadios(); append("² = 3a²") }
+            }
+
+            Text(
+                "Aplicando raíz cuadrada:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula {
+                TA { append("2 "); radio("A", "⁺"); append(" + 2 "); radio("B", "⁻"); append(" = √3 · a") }
+            }
+
+            Text(
+                "Despejando para a:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula {
+                TF("a = ", Color.White, 13.sp, true)
+                FF("1", "√3", Color.White, 12.sp)
+                TA(Color.White, 13.sp, true) { append(" · "); dobleSumaRadios() }
+            }
+        }
+
+        // 3) V = a³  →  fórmula final
+        SubTarjeta(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Text(
+                "Y como V = a³, entonces:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+                TF("V = [ ", Paleta.Cian, 16.sp, true)
+                FF("1", "√3", Paleta.Cian, 13.sp)
+                TA(Paleta.Cian, 16.sp, true) { append(" · "); dobleSumaRadios(); append(" ]³") }
+            }
+        }
+
+        // 4) RADIOS IÓNICOS Y CONVERSIÓN
+        SubTarjeta("RADIOS IÓNICOS Y CONVERSIÓN") {
+            FilaRadio("A", "⁺", datos.radioCatPm, datos.radioCatCmStr, ColorCation)
+            FilaRadio("B", "⁻", datos.radioAnPm, datos.radioAnCmStr, ColorAnion)
+        }
+
+        // 5) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN") {
+            LineaFormula {
+                TF("V = [ ")
+                FF("1", "√3")
+                TF(" (2 · ${datos.radioCatCmStr} + 2 · ${datos.radioAnCmStr}) ]³")
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Volumen total:", color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+
+
+}
+
+
+// ================    ANTIFLUORITA    ==================
+// ---------- Paso 3 para ANTIFLUORITA: a₁ = 2·a₀ (a₀ = arista de la subcelda tipo CsCl), V = a₁³ ----------
+
+@Composable
+fun ContenidoVolumenAntifluorita(datos: DatosCalculoRadio) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) FÓRMULAS BASE
+        SubTarjeta("FÓRMULAS BASE") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Caja(modifier = Modifier.weight(1f)) {
+                    TA(Color.White, 13.sp, true) { append("V = a"); sub("1"); append("³") }
+                }
+                Caja(modifier = Modifier.weight(1f)) {
+                    TA(Paleta.Cian, 12.sp, true) { append("a"); sub("1"); append(" = 2 a"); sub("0") }
+                }
+            }
+            Text(
+                "a₀ = arista de una subcelda tipo CsCl (la celda se divide en 8 subcubos)",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+        }
+
+        // 2) DESARROLLO DE a₀ (igual que CsCl)
+        SubTarjeta("DESARROLLO DE a₀ (SUBCELDA)") {
+            LineaFormula {
+                TA { dobleSumaRadios(); append("² = a"); sub("0"); append("² + a"); sub("0"); append("² + a"); sub("0"); append("²") }
+            }
+            LineaFormula {
+                TA { dobleSumaRadios(); append("² = 3a"); sub("0"); append("²") }
+            }
+
+            Text(
+                "Aplicando raíz cuadrada y despejando:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula {
+                TA(Color.White, 13.sp, true) { append("a"); sub("0"); append(" = ") }
+                FF("1", "√3", Color.White, 12.sp)
+                TA(Color.White, 13.sp, true) { append(" · "); dobleSumaRadios() }
+            }
+        }
+
+        // 3) a₁ = 2a₀  →  fórmula final
+        SubTarjeta(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Text(
+                "Como a₁ = 2a₀, entonces:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula {
+                TA(Color.White, 13.sp, true) { append("a"); sub("1"); append(" = ") }
+                FF("2", "√3", Color.White, 12.sp)
+                TA(Color.White, 13.sp, true) { append(" · "); dobleSumaRadios() }
+            }
+            Text(
+                "Y como V = a₁³:",
+                color = TextoApagado, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+            LineaFormula(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+                TF("V = [ ", Paleta.Cian, 16.sp, true)
+                FF("2", "√3", Paleta.Cian, 13.sp)
+                TA(Paleta.Cian, 16.sp, true) { append(" · "); dobleSumaRadios(); append(" ]³") }
+            }
+        }
+
+        // 4) RADIOS IÓNICOS Y CONVERSIÓN
+        SubTarjeta("RADIOS IÓNICOS Y CONVERSIÓN") {
+            FilaRadio("A", "⁺", datos.radioCatPm, datos.radioCatCmStr, ColorCation)
+            FilaRadio("B", "⁻", datos.radioAnPm, datos.radioAnCmStr, ColorAnion)
+        }
+
+        // 5) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN") {
+            LineaFormula {
+                TF("V = [ ")
+                FF("2", "√3")
+                TF(" (2 · ${datos.radioCatCmStr} + 2 · ${datos.radioAnCmStr}) ]³")
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Volumen total:", color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+// =====================================================================================
+//  UI DEL PASO 4 (DENSIDAD TEÓRICA) — VÁLIDO PARA TODAS LAS ESTRUCTURAS
+// =====================================================================================
+//  A diferencia del paso 3, este NO depende de la estructura: usa ρ = Z·M / (Nₐ·V) con
+//  los valores que ya vienen calculados en DatosCalculoRadio (z, masa molar, volumen).
+//  Se puede reutilizar tal cual para las 8 estructuras.
+// =====================================================================================
+
+private val ColorVolumen = Color(0xFFFF8A8A)
+private val TextoClaro = Color(0xFFD5DAE5)
+
+/** Fracción apilada genérica: numerador / línea / denominador. */
+@Composable
+private fun Fraccion(
+    numerador: AnnotatedString,
+    denominador: AnnotatedString,
+    color: Color = TextoClaro,
+    fontSize: TextUnit = 11.sp
+) {
+    Column(
+        modifier = Modifier.width(IntrinsicSize.Max),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(numerador, color = color, fontSize = fontSize, fontFamily = FontFamily.Monospace)
+        Box(Modifier.fillMaxWidth().height(1.dp).background(TextoApagado))
+        Text(denominador, color = color, fontSize = fontSize, fontFamily = FontFamily.Monospace)
+    }
+}
+
+/** "V" con subíndice "celda". */
+private fun AnnotatedString.Builder.vCelda() {
+    append("V")
+    withStyle(SpanStyle(baselineShift = BaselineShift.Subscript, fontSize = 0.75.em)) { append("celda") }
+}
+
+@Composable
+private fun FilaDato(
+    etiqueta: AnnotatedString,
+    valor: String,
+    colorValor: Color = Color.White
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(etiqueta, color = TextoApagado, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+        Text(
+            text = valor,
+            color = colorValor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            textAlign = TextAlign.End,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun SeparadorFino() {
+    Box(Modifier.fillMaxWidth().height(1.dp).background(BordeSubTarjeta.copy(alpha = 0.7f)))
+}
+
+/** Paso 4: densidad teórica. Sirve para cualquier estructura. */
+@Composable
+fun ContenidoDensidad(datos: DatosCalculoRadio) {
+    val masaTexto = "%.2f".format(java.util.Locale.US, datos.masaMolar)
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) ρ = m / V_celda   [ g / cm³ ]
+        SubTarjeta(bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("ρ", color = Paleta.Cian, fontSize = 18.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    Text("=", color = TextoClaro, fontSize = 14.sp, fontFamily = FontFamily.Monospace)
+                    Fraccion(
+                        numerador = AnnotatedString("m"),
+                        denominador = buildAnnotatedString { vCelda() },
+                        fontSize = 13.sp
+                    )
+                }
+                Caja {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text("[", color = TextoApagado, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        Fraccion(AnnotatedString("g"), AnnotatedString("cm³"), color = TextoApagado, fontSize = 11.sp)
+                        Text("]", color = TextoApagado, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    }
+                }
+            }
+        }
+
+        // 2) Datos
+        SubTarjeta {
+            FilaDato(AnnotatedString("Masa molar:"), "$masaTexto g/mol")
+            SeparadorFino()
+            FilaDato(AnnotatedString("z ="), "${datos.estructura.z} UF", Paleta.Cian)
+            SeparadorFino()
+            FilaDato(AnnotatedString("Avogadro ="), "6.022 × 10²³ mol⁻¹")
+            SeparadorFino()
+            FilaDato(
+                etiqueta = buildAnnotatedString { vCelda(); append(" =") },
+                valor = "${datos.volumenCm3Str} cm³",
+                colorValor = ColorVolumen
+            )
+        }
+
+        // 3) Metiéndola en la fórmula
+        SubTarjeta("METIÉNDOLA EN LA FORMULA:") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("ρ =", color = Paleta.Cian, fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("${datos.estructura.z} UF ×", color = TextoClaro, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                            Fraccion(AnnotatedString("$masaTexto g"), AnnotatedString("mol"), fontSize = 10.sp)
+                            Text("×", color = TextoApagado, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                            Fraccion(AnnotatedString("1 mol"), AnnotatedString("6.022 × 10²³ UF"), fontSize = 10.sp)
+                        }
+                        Box(Modifier.fillMaxWidth().height(1.dp).background(TextoApagado))
+                        Text(
+                            text = "${datos.volumenCm3Str} cm³",
+                            color = ColorVolumen,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+        }
+
+        // 4) Resultado
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Paleta.Cian.copy(alpha = 0.10f))
+                .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Resultado:", color = Color.White, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+            Text(
+                text = buildAnnotatedString {
+                    withStyle(SpanStyle(color = Paleta.Cian, fontSize = 18.sp, fontWeight = FontWeight.Bold)) { append("ρ") }
+                    withStyle(SpanStyle(color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)) { append(" = ") }
+                    withStyle(SpanStyle(color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)) { append(datos.densidadGcm3Str) }
+                    withStyle(SpanStyle(color = Paleta.Cian, fontSize = 12.sp)) { append(" g/cm³") }
+                },
+                fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.End,
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+}
+
+// =====================================================================================
+//  UI DEL PASO 3 (VOLUMEN DE LA CELDA) — MODO "PARÁMETRO a"
+// =====================================================================================
+//  Se elige por el SISTEMA CRISTALINO (no por cada estructura), así que sirve para las 8:
+//    CÚBICO     -> V = a³                 (NaCl, Blenda, CsCl, Fluorita, Antifluorita)
+//    HEXAGONAL  -> V = (√3/2) · a² · c    (Wurtzita, CdI₂)
+//    TETRAGONAL -> V = a² · c             (Rutilo)
+//  Es distinto al paso 3 del modo Radio (ese depende de la relación radio–parámetro).
+// =====================================================================================
+
+/** Paso 3 para el modo Parámetro a. Usa datos.aPm / datos.cPm (en pm). */
+@Composable
+fun ContenidoVolumenParametroA(datos: DatosCalculoRadio) {
+    val sistema = datos.estructura.sistema
+    val conC = sistema != SistemaCristalino.CUBICO
+
+    val formulaBase = when (sistema) {
+        SistemaCristalino.CUBICO -> "V = a³"
+        SistemaCristalino.HEXAGONAL -> "V = (√3/2) · a² · c"
+        SistemaCristalino.TETRAGONAL -> "V = a² · c"
+    }
+    val calculo = when (sistema) {
+        SistemaCristalino.CUBICO -> "V = [ ${datos.aCmStr} ]³"
+        SistemaCristalino.HEXAGONAL -> "V = (√3/2) × [ ${datos.aCmStr} ]² × [ ${datos.cCmStr} ]"
+        SistemaCristalino.TETRAGONAL -> "V = [ ${datos.aCmStr} ]² × [ ${datos.cCmStr} ]"
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // 1) FÓRMULAS BASE
+        SubTarjeta("FÓRMULAS BASE") {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    formulaBase, color = Color.White, fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        // 2) CONVERSIÓN pm -> cm
+        SubTarjeta("CONVERSIÓN") {
+            FilaConversion(AnnotatedString("a"), datos.aPm, datos.aCmStr, ColorCation)
+            if (conC) {
+                FilaConversion(AnnotatedString("c"), datos.cPm, datos.cCmStr, ColorAnion)
+            }
+        }
+
+        // 3) CÁLCULO DEL VOLUMEN
+        SubTarjeta("CÁLCULO DEL VOLUMEN", bordeColor = Paleta.Cian.copy(alpha = 0.3f)) {
+            Caja(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = calculo,
+                    color = Color(0xFFD5DAE5),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Paleta.Cian.copy(alpha = 0.10f))
+                    .border(1.dp, Paleta.Cian.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Volumen total:", color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    text = "V = ${datos.volumenCm3Str} cm³",
+                    color = Paleta.Cian, fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
