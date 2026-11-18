@@ -1,0 +1,3 @@
+- [ ] Add Bitmap saving helper in Visor3d.kt
+- [ ] Integrate screenshot saving into download actions
+- [ ] Build and verify project
